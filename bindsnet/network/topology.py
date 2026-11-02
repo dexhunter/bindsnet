@@ -629,23 +629,34 @@ class MulticompartmentConnection(AbstractMulticompartmentConnection):
         :param s: Incoming spikes, shape ``[batch, *source.shape]``.
         :return: Post-synaptic input, shape ``[batch, *target.shape]``.
         """
-        s = s.view(s.size(0), self.source.n)
-
         deferred = None
         if self._fold_cache is not None:
-            a_eff, b_sum = self._fold_cache
+            # The cache also holds the layer sizes, sparing the submodule lookups.
+            a_eff, b_sum, source_n, needs_view, target_shape = self._fold_cache
+            if s.dim() != 2 or s.size(1) != source_n:
+                s = s.view(s.size(0), source_n)
         else:
+            source_n, target_n = self.source.n, self.target.n
+            target_shape = tuple(self.target.shape)
+            if s.dim() != 2 or s.size(1) != source_n:
+                s = s.view(s.size(0), source_n)
+
             # running product of multiplicative factors, [source.n, target.n]
             a_eff = None
             # running additive offset, [source.n, target.n]; None while still zero
             b_eff = None
+            is_static = True
             for f in self.pipeline:
                 factor = f.compute(s)
+                is_static = is_static and getattr(f, "is_static", True)
                 # Compute-time side effects (e.g. per-time-step weight
                 # normalization) run after the fold has consumed this value.
                 d = getattr(f, "defer", None)
                 if d is not None:
-                    deferred = [d] if deferred is None else deferred + [d]
+                    if deferred is None:
+                        deferred = [d]
+                    else:
+                        deferred.append(d)
                 if factor is None:
                     # Side-effect-only pipeline entries (sub-features) fold as identity.
                     continue
@@ -656,7 +667,7 @@ class MulticompartmentConnection(AbstractMulticompartmentConnection):
                     # [batch, src, tgt] and are applied per sample below.
                     factor = factor.to_dense()
                     if factor.size(0) == 1:
-                        factor = factor.view(self.source.n, self.target.n)
+                        factor = factor.view(source_n, target_n)
                 op = getattr(f, "op", "mul")
                 if op == "mul":
                     a_eff = factor if a_eff is None else a_eff * factor
@@ -669,7 +680,7 @@ class MulticompartmentConnection(AbstractMulticompartmentConnection):
             if a_eff is None:
                 # Degenerate pipeline with no multiplicative feature: every source
                 # neuron contributes with unit weight.
-                a_eff = torch.ones(self.source.n, self.target.n, device=s.device)
+                a_eff = torch.ones(source_n, target_n, device=s.device)
             if not torch.is_floating_point(a_eff):
                 a_eff = a_eff.float()
 
@@ -677,32 +688,51 @@ class MulticompartmentConnection(AbstractMulticompartmentConnection):
             # their contribution is the source-sum, a constant [target.n] row.
             b_sum = b_eff.sum(dim=-2) if b_eff is not None else None
 
-            if all(getattr(f, "is_static", True) for f in self.pipeline):
-                self._fold_cache = (a_eff, b_sum)
+            # The result is ``[batch, a_eff.size(-1)]``; it needs the final view
+            # only for multi-dimensional (or mismatched) target shapes.
+            needs_view = target_shape != (a_eff.size(-1),)
+            if is_static:
+                self._fold_cache = (a_eff, b_sum, source_n, needs_view, target_shape)
+
+        dtype = a_eff.dtype
+        s_cast = s if s.dtype == dtype else s.to(dtype)
 
         # The gather pays for its ``nonzero()`` only where that sync is expensive
         # relative to the matmul: on CUDA it needs a large weight matrix to win;
         # on CPU there is no device sync, so it helps even at small sizes.
         use_gather = self.sparse_compute and (
-            not a_eff.is_cuda or self.source.n * self.target.n >= 4_000_000
+            not a_eff.is_cuda or source_n * a_eff.size(-1) >= 4_000_000
         )
         if a_eff.dim() == 3:  # one weight copy per sample (sparse, batch > 1)
-            out = torch.bmm(s.unsqueeze(1).to(a_eff.dtype), a_eff).squeeze(1)
+            out = torch.bmm(s_cast.unsqueeze(1), a_eff).squeeze(1)
         elif use_gather:
             # Read only the rows of A for source neurons that spiked this step
             # (numerically identical; faster only when few are active).
             active = s.any(dim=0).nonzero(as_tuple=False).squeeze(1)
-            if active.numel() == 0:
+            n_active = active.numel()
+            if n_active == 0:
                 out = torch.zeros(
-                    s.size(0), a_eff.size(-1), device=a_eff.device, dtype=a_eff.dtype
+                    s.size(0), a_eff.size(-1), device=a_eff.device, dtype=dtype
                 )
+            elif (
+                n_active == source_n
+                and s_cast.is_contiguous()
+                and a_eff.is_contiguous()
+            ):
+                # Every source spiked: the gathered rows are the full operands.
+                out = s_cast @ a_eff
             else:
-                out = s[:, active].to(a_eff.dtype) @ a_eff.index_select(0, active)
+                out = s_cast.index_select(1, active) @ a_eff.index_select(0, active)
         else:
-            out = s.to(a_eff.dtype) @ a_eff
+            out = s_cast @ a_eff
 
         if b_sum is not None:
-            out = out + b_sum
+            # ``out`` is a fresh matmul result, so the bias can be added in
+            # place whenever that keeps the dtype and shape of ``out + b_sum``.
+            if b_sum.dtype == out.dtype and b_sum.shape == out.shape[-b_sum.dim() :]:
+                out.add_(b_sum)
+            else:
+                out = out + b_sum
 
         if deferred is not None:
             for fn in deferred:
@@ -710,8 +740,8 @@ class MulticompartmentConnection(AbstractMulticompartmentConnection):
 
         if self.traces:
             self.activity = out
-        if out.size() != torch.Size([s.size(0), *self.target.shape]):
-            return out.view(s.size(0), *self.target.shape)
+        if needs_view:
+            return out.view(s.size(0), *target_shape)
         return out
 
     def compute_window(self, s: torch.Tensor) -> torch.Tensor:
